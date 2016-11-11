@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/bash -x
 
 # Simple Snapshot Command Wrapper
 # Copyright (c) 2014 John Goerzen
@@ -55,23 +55,42 @@ listsnaps () {
    $ZFS list -t snapshot -r -d 1 -H -o name "$2" | $GREP "@$1" || true
 }
 
-PATTERN="^[a-zA-Z0-9_/. -]\+\$"
+shared () {
+       TEMPLATE="__simplesnap_$1_"
+       TEMPLATEPATTERN="^[a-zA-Z0-9]\+\$"
+       echo "a$1" | $GREP -q "${TEMPLATEPATTERN}" || exiterror "Invalid characters in template \"$1\"; pattern is ${TEMPLATEPATTERN}"
+       DATASET="$2"
+       echo "_${DATASET}" | $GREP -vq " " || exiterror "Space found in dataset name"
+       [ -z "${DATASET}" ] && exiterror "No dataset given."
+       [ -z "$1" ] && exiterror "No template given."
+
+       return 0
+}
+
+PATTERN="^[a-zA-Z0-9_/. -=]\+\$"
 if [ "$1" = "reinvoked" ]; then
   shift
-  logit "Reinvoked with paramters \"$*\""
-  shift # Drop the call to simplesnapwrap
+  logit "Reinvoked with parameters \"$*\""
 
-  # Validate again.  Just to be sure.
-  echo ".$*" | $GREP -q "${PATTERN}" || exiterror "Invalid characters found on re-validate; pattern is ${PATTERN}"
-  echo ".$*" | $GREP -vq '\.\.' || exiterror "Found .. in input; aborting."
+  if [ "$1" != "rsync" ]; then
+    shift # Drop the call to simplesnapwrap
+    # Validate again.  Just to be sure.
+    echo ".$*" | $GREP -q "${PATTERN}" || exiterror "Invalid characters found on re-validate; pattern is ${PATTERN}"
+    echo ".$*" | $GREP -vq '\.\.' || exiterror "Found .. in input; aborting."
 
-  # We don't want any paramters to contain a space or leading dash.
-  for ARG; do
-    echo ",${ARG}" | $GREP -vq '^,-' || exiterror "Found leading '-' in parameter \"${ARG}\"; aborting."
-    echo ",${ARG}" | $GREP -vq ' ' || exiterror "Found space in parameters; aborting."
-  done
-  MODE="$1"
-  shift || exiterror "Missing mode."
+    MODE="$1"
+    shift || exiterror "Missing mode."
+
+    # We don't want any parameters to contain a space or leading dash.
+    for ARG; do
+      echo ",${ARG}" | $GREP -vq '^,-' || exiterror "Found leading '-' in parameter \"${ARG}\"; aborting."
+      echo ",${ARG}" | $GREP -vq ' ' || exiterror "Found space in parameters; aborting."
+    done
+  else
+    MODE="rsync"
+    shift
+  fi
+
   case "$MODE" in
     "listfs")
        logit "Listing ZFS datasets without ${EXCLUDEPROP}=on"
@@ -79,14 +98,7 @@ if [ "$1" = "reinvoked" ]; then
           $GREP -v $'\ton$' | $SED $'s/\t.*$//'
        ;;
     "sendback")
-       # Next lines shared with reap
-       TEMPLATE="__simplesnap_$1_"
-       TEMPLATEPATTERN="^[a-zA-Z0-9]\+\$"
-       echo "a$1" | $GREP -q "${TEMPLATEPATTERN}" || exiterror "Invalid characters in sendback template \"$1\"; pattern is ${TEMPLATEPATTERN}"
-       DATASET="$2"
-       echo "_${DATASET}" | $GREP -vq " " || exiterror "Space found in dataset name"
-       [ -z "${DATASET}" ] && exiterror "No dataset given."
-       [ -z "$1" ] && exiterror "No template given."
+       shared $@
 
        logit "Listing snapshots on \"${DATASET}\" with template \"${TEMPLATE}\""
 
@@ -113,16 +125,46 @@ if [ "$1" = "reinvoked" ]; then
          $ZFS send -I "${OLDESTSNAP}" "${NEWFULLSNAP}"
        fi
        ;;
+    "makeasyncfile")
+       shared $@
+
+       ASYNCFILENAME="$3"
+       [ -z "${ASYNCFILENAME}" ] && exiterror "No filename given for temporary snapshot storage."
+
+       # if file exists, use it - if not, create one
+       if [ ! -f "${ASYNCFILENAME}" ]; then
+         logit "File \"${ASYNCFILENAME}\" does not exist; creating snapshot and file."
+         logit "Listing snapshots on \"${DATASET}\" with template \"${TEMPLATE}\""
+         OLDESTSNAP="`listsnaps \"${TEMPLATE}\" \"${DATASET}\" | head -n 1`"
+         if [ -z "${OLDESTSNAP}" ]; then
+           logit "Found no existing snapshot."
+         else
+           logit "Will use ${OLDESTSNAP} as basis."
+         fi
+
+         # Make a new snapshot.
+         NEWSNAP="${TEMPLATE}`$DATE +%FT%T`__"
+         NEWFULLSNAP="${DATASET}@${NEWSNAP}"
+         logit "Making snapshot ${NEWFULLSNAP}"
+         $ZFS snapshot "${NEWFULLSNAP}"
+
+         if [ -z "${OLDESTSNAP}" ]; then
+           # No existing snapshot. Dump the whole thing.
+           logit "Sending non-incremental stream."
+           $ZFS send "${NEWFULLSNAP}" | pigz > "${ASYNCFILENAME}"
+         else
+           # Use the oldest existing snapshot.
+	   logit "Sending incremental stream back to ${OLDESTSNAP}"
+           $ZFS send -I "${OLDESTSNAP}" "${NEWFULLSNAP}" | pigz > "${ASYNCFILENAME}"
+         fi
+       fi
+       ;;
+    "rsync")
+       rsync $@
+       ;;
     "reap")
-       # Next lines shared with sendback
-       TEMPLATE="__simplesnap_$1_"
-       TEMPLATEPATTERN="^[a-zA-Z0-9_]\+\$"
-       echo "_$TEMPLATE" | $GREP -q "${TEMPLATEPATTERN}" || exiterror "Invalid characters in reap template; pattern is ${TEMPLATEPATTERN}"
-       DATASET="$2"
-       echo "_${DATASET}" | $GREP -vq " " || exiterror "Space found in dataset name"
-       [ -z "${DATASET}" ] && exiterror "No dataset given."
-       [ -z "$1" ] && exiterror "No template given."
-        
+       shared $@
+
        # We always save the most recent.
        SNAPSTOREMOVE="`listsnaps \"${TEMPLATE}\" \"${DATASET}\" | head -n -1`"
        if [ -z "${SNAPSTOREMOVE}" ]; then
@@ -134,6 +176,28 @@ if [ "$1" = "reinvoked" ]; then
             $ZFS destroy "${REMOVAL}"
          done
        fi
+       ;;
+    "reapasyncfile")
+       shared $@
+
+       ASYNCFILENAME="$3"
+       [ -z "${ASYNCFILENAME}" ] && exiterror "No filename given for temporary snapshot storage."
+
+       logit "Deleting ${ASYNCFILENAME}, along with snapshots."
+
+       # We always save the most recent.
+       SNAPSTOREMOVE="`listsnaps \"${TEMPLATE}\" \"${DATASET}\" | head -n -1`"
+       if [ -z "${SNAPSTOREMOVE}" ]; then
+         logit "No snapshots to remove."
+       else
+         for REMOVAL in ${SNAPSTOREMOVE}; do
+            logit "Destroying snapshot ${REMOVAL}"
+            echo "_${REMOVAL}" | $GREP -q '@' || exiterror "PANIC: snapshot name doesn't contain '@'"
+            $ZFS destroy "${REMOVAL}"
+         done
+       fi
+
+       rm "${ASYNCFILENAME}"
        ;;
     *)
        exiterror "Invalid mode \"${MODE}\" specified."

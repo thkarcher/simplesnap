@@ -135,6 +135,11 @@ while [ -n "$1" ]; do
       LOCALMODE="on"
       shift
       ;;
+    "--async")
+      ASYNCPATH="$2"
+      REMOTEASYNCFILENAME="$3"
+      shift 3
+      ;;
     *)
       syntaxerror "Unknown option \"$1\""
       ;;
@@ -185,6 +190,19 @@ CHECKRETVAL=0
 
 runzfs () {
   runcommand /sbin/zfs "$@"
+}
+
+runrsync () {
+   REMFILE=$1
+   LOCFILE=$2
+
+   RSYNCRETVAL=-1
+   while [ $RSYNCRETVAL -ne 0 ]; do
+      runcommand rsync --timeout=600 --inplace --partial ${HOST}:${REMFILE} ${LOCFILE} ; RSYNCRETVAL=$?
+   done
+   logit "Completed rsync."
+
+   return 0
 }
 
 checkbackups () {
@@ -288,7 +306,23 @@ backupto() {
         exiterror "Dataset \"$DATASET\" contains ..; something is wrong.  Aborting."
     fi
 
-    if runwrap sendback "${SETNAME}" "${DATASET}" | \
+    if [ -n "$ASYNCPATH" ]; then
+        # the same filename will be used over and over again if not reaped
+        runwrap makeasyncfile "${SETNAME}" "${DATASET}" "${REMOTEASYNCFILENAME}"
+        runrsync "${REMOTEASYNCFILENAME}" "${ASYNCPATH}"
+        LOCALFILENAME="$ASYNCPATH"/`basename "${REMOTEASYNCFILENAME}"`
+
+        # file is now "here"
+        if cat $LOCALFILENAME | pigz -d | runzfs receive -F "${DESTDIR}" ; then
+            logit "Received backup asyncronously (via file $LOCALFILENAME) into ${DESTDIR}"
+            runwrap reapasyncfile "${SETNAME}" "${DATASET}" "${REMOTEASYNCFILENAME}"
+            reap "${DESTDIR}"
+            rm $LOCALFILENAME
+        else
+            logit "zfs receive died with error: $?"
+            exit 100
+        fi
+    elif runwrap sendback "${SETNAME}" "${DATASET}" | \
        runzfs receive -F "${DESTDIR}"; then
 
         logit "Received backup into ${DESTDIR}"
